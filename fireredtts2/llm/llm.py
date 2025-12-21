@@ -81,6 +81,7 @@ class ModelArgs:
     audio_num_codebooks: int
     decoder_loss_weight: float
     use_text_loss: bool
+    decoder_sampling_ratio: float = 0.125  # default 1/8 sampling for decoder training
 
 
 class Model(nn.Module, PyTorchModelHubMixin):
@@ -113,6 +114,7 @@ class Model(nn.Module, PyTorchModelHubMixin):
 
         self.decoder_loss_weight = config.decoder_loss_weight
         self.use_text_loss = config.use_text_loss
+        self.decoder_sampling_ratio = config.decoder_sampling_ratio
 
     def setup_caches(self, max_batch_size: int) -> torch.Tensor:
         """Setup KV caches and return a causal mask."""
@@ -198,9 +200,10 @@ class Model(nn.Module, PyTorchModelHubMixin):
         text_logits = self.text_head(text_h)
         text_loss = F.cross_entropy(text_logits, text_target_tokens, ignore_index=0)
 
-        # "compute amortization" (train decoder on random 1/8 subset of audio tokens)
-        # important change to 1/8
-        indices = torch.randperm(c_embeds.size(0))[: c_embeds.size(0) // 8]
+        # "compute amortization" (train decoder on random subset of audio tokens)
+        # decoder_sampling_ratio: 1/8 (default) for efficiency, 1.0 for determinism
+        num_samples = int(c_embeds.size(0) * self.decoder_sampling_ratio)
+        indices = torch.randperm(c_embeds.size(0))[:num_samples]
         # [audio_len//16, n_codebooks-1, embed_dim]
         c_embeds = c_embeds[indices][:, :-1, :]
         audio_h = audio_h[indices]  # [audio_len//16, embed_dim]
