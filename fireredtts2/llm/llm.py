@@ -256,6 +256,8 @@ class Model(nn.Module, PyTorchModelHubMixin):
         input_pos: torch.Tensor,
         temperature: float,
         topk: int,
+        depth_decoder_temperature: float = 0.75,
+        depth_decoder_topk: int = 10,
     ) -> torch.Tensor:
         """
         Args:
@@ -299,7 +301,7 @@ class Model(nn.Module, PyTorchModelHubMixin):
                 self.projection(curr_h), input_pos=curr_pos, mask=curr_decoder_mask
             ).to(dtype=dtype)
             ci_logits = torch.mm(decoder_h[:, -1, :], self.audio_head[i - 1])
-            ci_sample = sample_topk(ci_logits, 10, 0.75)  # fix to 10 and 0.75
+            ci_sample = sample_topk(ci_logits, depth_decoder_topk, depth_decoder_temperature)
             ci_embed = self._embed_audio(i, ci_sample)
             curr_h = ci_embed
             curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
