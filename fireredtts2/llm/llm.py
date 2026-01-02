@@ -157,6 +157,7 @@ class Model(nn.Module, PyTorchModelHubMixin):
 
         # get targets and codebook embeddings corresponding to audio tokens
         audio_mask = tokens_mask[:, :, 0]  # [bsz, seq_len]
+        audio_positions = audio_mask.nonzero(as_tuple=False)
         target_tokens = tokens[audio_mask][:, :-1]  # [audio_len, n_codebooks]
         # [audio_len, n_codebooks, embed_dim]
         c_embeds = embeds[:, :, :-1, :][audio_mask]
@@ -189,16 +190,34 @@ class Model(nn.Module, PyTorchModelHubMixin):
         )
 
         # get backbone embeddings used for audio codebook prediction predict first codebook and compute loss
-        audio_mask = torch.roll(audio_mask, -1, 1)  # shift audio mask to the right by 1
-        audio_h = h[audio_mask]  # [audio_len, embed_dim]
+        audio_mask_shifted = torch.roll(audio_mask, -1, 1)  # shift audio mask to the right by 1
+        audio_h = h[audio_mask_shifted]  # [audio_len, embed_dim]
         c0_logits = self.codebook0_head(audio_h)  # [audio_len, audio_vocab_size]
         c0_target = target_tokens[:, 0]  # [audio_len]
         c0_loss = F.cross_entropy(c0_logits, c0_target)
+        backbone_logits = torch.zeros(
+            bsz,
+            seq_len,
+            self.config.audio_vocab_size,
+            device=device,
+            dtype=c0_logits.dtype,
+        )
+        if audio_mask_shifted.any():
+            backbone_logits[audio_mask_shifted] = c0_logits
 
         # predict text loss
         text_h = h[text_mask]
         text_logits = self.text_head(text_h)
         text_loss = F.cross_entropy(text_logits, text_target_tokens, ignore_index=0)
+        full_text_logits = torch.zeros(
+            bsz,
+            seq_len,
+            self.config.text_vocab_size,
+            device=device,
+            dtype=text_logits.dtype,
+        )
+        if text_mask.any():
+            full_text_logits[text_mask] = text_logits
 
         # "compute amortization" (train decoder on random subset of audio tokens)
         # decoder_sampling_ratio: 1/8 (default) for efficiency, 1.0 for determinism
@@ -229,9 +248,43 @@ class Model(nn.Module, PyTorchModelHubMixin):
         ).to(dtype=dtype)
         c_logits = torch.einsum("bsd,sdv->bsv", decoder_h[:, 1:, :], self.audio_head)
 
-        c_loss = F.cross_entropy(
-            c_logits.reshape(-1, c_logits.size(-1)), target_tokens.reshape(-1)
+        per_token_loss = F.cross_entropy(
+            c_logits.reshape(-1, c_logits.size(-1)),
+            target_tokens.reshape(-1),
+            reduction="none",
         )
+        c_loss = per_token_loss.mean()
+        per_token_loss = per_token_loss.view(c_logits.size(0), c_logits.size(1))
+        depth_decoder_logits = torch.zeros(
+            bsz,
+            seq_len,
+            self.config.audio_num_codebooks - 1,
+            self.config.audio_vocab_size,
+            device=device,
+            dtype=c_logits.dtype,
+        )
+        depth_decoder_loss_per_token = torch.zeros(
+            bsz,
+            seq_len,
+            self.config.audio_num_codebooks - 1,
+            device=device,
+            dtype=per_token_loss.dtype,
+        )
+        depth_decoder_sample_mask = torch.zeros(
+            bsz,
+            seq_len,
+            device=device,
+            dtype=torch.bool,
+        )
+        if indices.numel() > 0:
+            sampled_positions = audio_positions[indices]
+            depth_decoder_logits[
+                sampled_positions[:, 0], sampled_positions[:, 1]
+            ] = c_logits
+            depth_decoder_loss_per_token[
+                sampled_positions[:, 0], sampled_positions[:, 1]
+            ] = per_token_loss
+            depth_decoder_sample_mask[sampled_positions[:, 0], sampled_positions[:, 1]] = True
 
         if self.use_text_loss:
             loss = (
@@ -247,7 +300,17 @@ class Model(nn.Module, PyTorchModelHubMixin):
                 (1 - self.decoder_loss_weight) * c0_loss
                 + self.decoder_loss_weight * c_loss
             )
-        return loss, text_loss, c0_loss, c_loss
+        return (
+            loss,
+            text_loss,
+            c0_loss,
+            c_loss,
+            full_text_logits,
+            backbone_logits,
+            depth_decoder_logits,
+            depth_decoder_loss_per_token,
+            depth_decoder_sample_mask,
+        )
 
     def generate_frame(
         self,
