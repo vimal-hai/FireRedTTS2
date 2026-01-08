@@ -350,7 +350,7 @@ class Model(nn.Module, PyTorchModelHubMixin):
         Generate one audio frame with optional logits return.
         
         Debugging kwargs:
-            text_eos_idx: (int) - text EOS token index for logging.
+            last_text_eos_pos: (int) - Position of last text EOS token in sequence (for logging).
 
         Args:
             tokens: (batch_size, seq_len, audio_num_codebooks+1)
@@ -371,11 +371,11 @@ class Model(nn.Module, PyTorchModelHubMixin):
         b, s, _ = tokens.size()
 
         # Debugging kwargs
-        text_eos_idx = kwargs.get("text_eos_idx", None)
+        last_text_eos_pos = kwargs.get("last_text_eos_pos", None)
         distance_from_text_eos = None
-        if text_eos_idx is not None:
-            logger.debug(f"text_eos_idx: {text_eos_idx}")
-            distance_from_text_eos = curr_pos - text_eos_idx
+        if last_text_eos_pos is not None:
+            logger.debug(f"last_text_eos_pos: {last_text_eos_pos}")
+            distance_from_text_eos = curr_pos - last_text_eos_pos
 
         assert self.backbone.caches_are_enabled(), "backbone caches are not enabled"
         curr_backbone_mask = _index_causal_mask(self.backbone_causal_mask, input_pos)
@@ -419,7 +419,7 @@ class Model(nn.Module, PyTorchModelHubMixin):
 
                     logger.info(f"Batch {batch_idx} - Current position: {curr_pos[batch_idx]}")
                     if distance_from_text_eos is not None:
-                        logger.info(f"Batch {batch_idx} - Distance from last text_eos_idx: {distance_from_text_eos}")
+                        logger.info(f"Batch {batch_idx} - Distance from last text EOS position: {distance_from_text_eos}")
 
                     logger.info(f"Batch {batch_idx} - Token 0           -- {c0_logits[batch_idx, 0]}        -- {softmax_probs[0]}")
                     logger.info(f"Batch {batch_idx} - max (Token {sorted_indices[0]}) -- {c0_logits[batch_idx, sorted_indices[0]]}        -- {softmax_probs[sorted_indices[0]]}")
