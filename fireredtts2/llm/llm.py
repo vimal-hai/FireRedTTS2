@@ -4,7 +4,9 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from huggingface_hub import PyTorchModelHubMixin
 from fireredtts2.llm.modules import FLAVORS
+import logging
 
+logger = logging.getLogger(__name__)
 
 def _prepare_transformer(model):
     embed_dim = model.tok_embeddings.embedding_dim
@@ -36,16 +38,35 @@ def _multinomial_sample_one_no_sync(probs):
     return torch.argmax(probs / q, dim=-1, keepdim=True).to(dtype=torch.int)
 
 
-def sample_topk(logits: torch.Tensor, topk: int, temperature: float):
+def sample_topk_and_return_indices(logits: torch.Tensor, topk: int, temperature: float, eos_only_argmax: bool = False, codebook_eos_token_id: int = 0):
     logits = logits / temperature
 
     filter_value: float = -float("Inf")
-    indices_to_remove = logits < torch.topk(logits, topk)[0][..., -1, None]
+    topk_values = torch.topk(logits, topk)[0]
+    indices_to_remove = logits < topk_values[..., -1, None]
+    
+    # If eos_only_argmax is True, only allow EOS if it's the argmax
+    if eos_only_argmax:
+        # Get the argmax token index
+        argmax_token = torch.argmax(logits, dim=-1, keepdim=True)
+        # If EOS is not the argmax, filter it out
+        eos_not_argmax = (argmax_token != codebook_eos_token_id)
+        indices_to_remove[..., codebook_eos_token_id] = torch.where(
+            eos_not_argmax.squeeze(-1),
+            torch.tensor(True, dtype=torch.bool, device=logits.device),
+            indices_to_remove[..., codebook_eos_token_id]
+        )
+    
     scores_processed = logits.masked_fill(indices_to_remove, filter_value)
+    indices_to_keep = torch.nonzero(~indices_to_remove, as_tuple=False)
     scores_processed = torch.nn.functional.log_softmax(scores_processed, dim=-1)
     probs = torch.nn.functional.softmax(scores_processed, dim=-1)
 
     sample_token = _multinomial_sample_one_no_sync(probs)
+    return sample_token, indices_to_keep, topk_values
+
+def sample_topk(logits: torch.Tensor, topk: int, temperature: float):
+    sample_token, _, _ = sample_topk_and_return_indices(logits, topk, temperature)
     return sample_token
 
 
@@ -312,7 +333,7 @@ class Model(nn.Module, PyTorchModelHubMixin):
             depth_decoder_sample_mask,
         )
 
-    def generate_frame(
+    def generate_frame_and_logits(
         self,
         tokens: torch.Tensor,
         tokens_mask: torch.Tensor,
@@ -321,19 +342,40 @@ class Model(nn.Module, PyTorchModelHubMixin):
         topk: int,
         depth_decoder_temperature: float = 0.75,
         depth_decoder_topk: int = 10,
+        eos_only_argmax: bool = False,
+        codebook_eos_token_id: int = 0,
+        **kwargs,
     ) -> torch.Tensor:
         """
+        Generate one audio frame with optional logits return.
+        
+        Debugging kwargs:
+            text_eos_idx: (int) - text EOS token index for logging.
+
         Args:
             tokens: (batch_size, seq_len, audio_num_codebooks+1)
             tokens_mask: (batch_size, seq_len, audio_num_codebooks+1)
             input_pos: (batch_size, seq_len) positions for each token
-            mask: (batch_size, seq_len, max_seq_len
+            temperature: Sampling temperature for backbone generation.
+            topk: Top-k sampling for backbone generation.
+            depth_decoder_temperature: Temperature for depth decoder sampling.
+            depth_decoder_topk: Top-k for depth decoder sampling.
+            eos_only_argmax: If True, only sample EOS if it has the highest probability.
+                This prevents premature EOS sampling when it's not the most likely next token.
+            codebook_eos_token_id: Token ID representing EOS in the codebook (default: 0).
 
         Returns:
             (batch_size, audio_num_codebooks) sampled tokens
         """
         dtype = next(self.parameters()).dtype
         b, s, _ = tokens.size()
+
+        # Debugging kwargs
+        text_eos_idx = kwargs.get("text_eos_idx", None)
+        distance_from_text_eos = None
+        if text_eos_idx is not None:
+            logger.debug(f"text_eos_idx: {text_eos_idx}")
+            distance_from_text_eos = curr_pos - text_eos_idx
 
         assert self.backbone.caches_are_enabled(), "backbone caches are not enabled"
         curr_backbone_mask = _index_causal_mask(self.backbone_causal_mask, input_pos)
@@ -346,7 +388,7 @@ class Model(nn.Module, PyTorchModelHubMixin):
 
         last_h = h[:, -1, :]
         c0_logits = self.codebook0_head(last_h)
-        c0_sample = sample_topk(c0_logits, topk, temperature)
+        c0_sample, c0_indices_to_keep, topk_values = sample_topk_and_return_indices(c0_logits, topk, temperature, eos_only_argmax, codebook_eos_token_id)
         c0_embed = self._embed_audio(0, c0_sample)
         curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1)
         curr_sample = c0_sample.clone()
@@ -355,6 +397,36 @@ class Model(nn.Module, PyTorchModelHubMixin):
             .unsqueeze(0)
             .repeat(curr_h.size(0), 1)
         )
+
+        # If token 0 is in topk, then print logit value, and softmax value only if DEBUG mode is enabled
+        if logger.isEnabledFor(logging.DEBUG) and (c0_logits[..., 0] >= topk_values[..., -1]).any():
+            # Current position in the sequence
+            curr_pos = input_pos[..., -1]
+        
+            
+            # Handle batched tensors properly
+            for batch_idx in range(c0_logits.shape[0]):
+                if c0_logits[batch_idx, 0] >= topk_values[batch_idx, -1]:
+                    softmax_probs = torch.nn.functional.softmax(c0_logits[batch_idx], dim=-1)
+
+                    # Get token indices for this specific batch
+                    batch_mask = c0_indices_to_keep[:, 0] == batch_idx
+                    batch_token_indices = c0_indices_to_keep[batch_mask, 1]
+
+                    # Sort these token indices by their logit values
+                    sorted_order = torch.argsort(c0_logits[batch_idx, batch_token_indices], descending=True)
+                    sorted_indices = batch_token_indices[sorted_order]
+
+                    logger.info(f"Batch {batch_idx} - Current position: {curr_pos[batch_idx]}")
+                    if distance_from_text_eos is not None:
+                        logger.info(f"Batch {batch_idx} - Distance from last text_eos_idx: {distance_from_text_eos}")
+
+                    logger.info(f"Batch {batch_idx} - Token 0           -- {c0_logits[batch_idx, 0]}        -- {softmax_probs[0]}")
+                    logger.info(f"Batch {batch_idx} - max (Token {sorted_indices[0]}) -- {c0_logits[batch_idx, sorted_indices[0]]}        -- {softmax_probs[sorted_indices[0]]}")
+                    logger.info(f"Batch {batch_idx} - min (Token {sorted_indices[-1]}) -- {c0_logits[batch_idx, sorted_indices[-1]]}        -- {softmax_probs[sorted_indices[-1]]}")
+                    logger.info(f"Batch {batch_idx} - median (Token {sorted_indices[len(sorted_indices) // 2]}) -- {c0_logits[batch_idx, sorted_indices[len(sorted_indices) // 2]]}        -- {softmax_probs[sorted_indices[len(sorted_indices) // 2]]}")
+                    sampled_token = c0_sample[batch_idx].item()
+                    logger.info(f"Batch {batch_idx} - c0_sample (Token {c0_sample[batch_idx].item()}):        -- {c0_logits[batch_idx, sampled_token]}           -- {softmax_probs[c0_sample[batch_idx]]}")
 
         # Decoder caches must be reset every frame.
         self.decoder.reset_caches()
@@ -370,6 +442,10 @@ class Model(nn.Module, PyTorchModelHubMixin):
             curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
             curr_pos = curr_pos[:, -1:] + 1
 
+        return curr_sample, c0_logits, ci_logits
+    
+    def generate_frame(self, tokens: torch.Tensor, tokens_mask: torch.Tensor, input_pos: torch.Tensor, temperature: float, topk: int, depth_decoder_temperature: float = 0.75, depth_decoder_topk: int = 10, **kwargs) -> torch.Tensor:
+        curr_sample = self.generate_frame_and_logits(tokens, tokens_mask, input_pos, temperature, topk, depth_decoder_temperature, depth_decoder_topk, **kwargs)
         return curr_sample
 
     def reset_caches(self):
