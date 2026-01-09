@@ -396,9 +396,9 @@ class Model(nn.Module, PyTorchModelHubMixin):
         # immediate stop with no chance to recover.
         #
         # Solution: Gate EOS sampling with three requirements:
-        #   1. Probability: EOS must have >= eos_p_threshold probability (default 0.50)
-        #   2. Margin: EOS logit must be >= eos_margin above runner-up (default 1.0)
-        #   3. Debounce: EOS must stay "strong" for eos_debounce_k steps (default 2)
+        #   1. Probability: EOS must have >= eos_p_threshold probability (default 0.0)
+        #   2. Margin: EOS logit must be >= eos_margin above runner-up (default -inf)
+        #   3. Debounce: EOS must stay "strong" for eos_debounce_k steps (default 1)
         #
         # If EOS not allowed, mask to -inf → forces non-EOS sample.
         # State (eos_strong_streak) passed via kwargs for concurrency safety.
@@ -406,9 +406,9 @@ class Model(nn.Module, PyTorchModelHubMixin):
         # See kanzi repo: packages/chantek-monolith/IMPLEMENTATION_PLAN.md
         #
         # Extract EOS gating parameters from kwargs
-        eos_p_threshold = kwargs.get("eos_p_threshold", 0.50)
-        eos_margin = kwargs.get("eos_margin", 1.0)
-        eos_debounce_k = kwargs.get("eos_debounce_k", 2)
+        eos_p_threshold = kwargs.get("eos_p_threshold", 0.0)
+        eos_margin = kwargs.get("eos_margin", float('-inf'))
+        eos_debounce_k = kwargs.get("eos_debounce_k", 1)
         eos_strong_streak = kwargs.get("eos_strong_streak", None)
 
         # Initialize streak if not provided (fallback: no debounce state)
