@@ -443,16 +443,17 @@ class Model(nn.Module, PyTorchModelHubMixin):
         else:
             allow_eos = is_strong
 
-        # Mask out EOS where not allowed
+        # Mask out EOS where not allowed (create masked copy for sampling only)
+        c0_logits_for_sampling = c0_logits
         if (~allow_eos).any():
-            c0_logits = c0_logits.clone()
-            c0_logits[~allow_eos, codebook_eos_token_id] = -float("inf")
+            c0_logits_for_sampling = c0_logits.clone()
+            c0_logits_for_sampling[~allow_eos, codebook_eos_token_id] = -float("inf")
 
         # Update streak state in kwargs (mutable dict, passed by reference)
         kwargs["eos_strong_streak"] = eos_strong_streak
         # ===== END EOS GATING LOGIC =====
 
-        c0_sample, c0_indices_to_keep, topk_values = sample_topk_and_return_indices(c0_logits, topk, temperature, eos_only_argmax, codebook_eos_token_id)
+        c0_sample, c0_indices_to_keep, topk_values = sample_topk_and_return_indices(c0_logits_for_sampling, topk, temperature, eos_only_argmax, codebook_eos_token_id)
         c0_embed = self._embed_audio(0, c0_sample)
         curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1)
         curr_sample = c0_sample.clone()
