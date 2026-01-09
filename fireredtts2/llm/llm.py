@@ -444,8 +444,27 @@ class Model(nn.Module, PyTorchModelHubMixin):
 
         return curr_sample, c0_logits, ci_logits
     
-    def generate_frame(self, tokens: torch.Tensor, tokens_mask: torch.Tensor, input_pos: torch.Tensor, temperature: float, topk: int, depth_decoder_temperature: float = 0.75, depth_decoder_topk: int = 10, **kwargs) -> torch.Tensor:
-        curr_sample = self.generate_frame_and_logits(tokens, tokens_mask, input_pos, temperature, topk, depth_decoder_temperature, depth_decoder_topk, **kwargs)
+    def generate_frame(
+        self,
+        tokens: torch.Tensor,
+        tokens_mask: torch.Tensor, 
+        input_pos: torch.Tensor,
+        temperature: float,
+        topk: int,
+        depth_decoder_temperature: float = 0.75,
+        depth_decoder_topk: int = 10,
+        **kwargs
+    ) -> torch.Tensor:
+        curr_sample, _, _ = self.generate_frame_and_logits(
+            tokens=tokens,
+            tokens_mask=tokens_mask,
+            input_pos=input_pos,
+            temperature=temperature,
+            topk=topk,
+            depth_decoder_temperature=depth_decoder_temperature,
+            depth_decoder_topk=depth_decoder_topk,
+            **kwargs
+        )
         return curr_sample
 
     def reset_caches(self):
