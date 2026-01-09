@@ -388,6 +388,56 @@ class Model(nn.Module, PyTorchModelHubMixin):
 
         last_h = h[:, -1, :]
         c0_logits = self.codebook0_head(last_h)
+
+        # ===== EOS GATING LOGIC =====
+        # Prevent premature EOS by requiring confidence + (optionally) debounce
+        # Extract EOS gating parameters from kwargs
+        eos_p_threshold = kwargs.get("eos_p_threshold", 0.50)
+        eos_margin = kwargs.get("eos_margin", 1.0)
+        eos_debounce_k = kwargs.get("eos_debounce_k", 2)
+        eos_strong_streak = kwargs.get("eos_strong_streak", None)
+
+        # Initialize streak if not provided (fallback: no debounce state)
+        if eos_strong_streak is None:
+            eos_strong_streak = torch.zeros(
+                c0_logits.size(0), dtype=torch.long, device=c0_logits.device
+            )
+
+        # Compute temperature-consistent logits for EOS gating
+        logits_t = c0_logits / max(temperature, 1e-6)
+
+        # EOS probability under current temperature
+        p = torch.softmax(logits_t, dim=-1)
+        p_eos = p[:, codebook_eos_token_id]  # [B]
+
+        # EOS margin vs runner-up
+        top2 = torch.topk(logits_t, k=2, dim=-1).values  # [B, 2]
+        second = top2[:, 1]
+        eos_logit = logits_t[:, codebook_eos_token_id]
+
+        # Check if EOS is "strong" (both high probability and large margin)
+        is_strong = (p_eos >= eos_p_threshold) & ((eos_logit - second) >= eos_margin)
+
+        # Debounce: EOS must be strong for K consecutive steps
+        if eos_debounce_k > 1:
+            eos_strong_streak = torch.where(
+                is_strong,
+                eos_strong_streak + 1,
+                torch.zeros_like(eos_strong_streak),
+            )
+            allow_eos = eos_strong_streak >= eos_debounce_k
+        else:
+            allow_eos = is_strong
+
+        # Mask out EOS where not allowed
+        if (~allow_eos).any():
+            c0_logits = c0_logits.clone()
+            c0_logits[~allow_eos, codebook_eos_token_id] = -float("inf")
+
+        # Update streak state in kwargs (mutable dict, passed by reference)
+        kwargs["eos_strong_streak"] = eos_strong_streak
+        # ===== END EOS GATING LOGIC =====
+
         c0_sample, c0_indices_to_keep, topk_values = sample_topk_and_return_indices(c0_logits, topk, temperature, eos_only_argmax, codebook_eos_token_id)
         c0_embed = self._embed_audio(0, c0_sample)
         curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1)
