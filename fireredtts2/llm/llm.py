@@ -390,7 +390,21 @@ class Model(nn.Module, PyTorchModelHubMixin):
         c0_logits = self.codebook0_head(last_h)
 
         # ===== EOS GATING LOGIC =====
-        # Prevent premature EOS by requiring confidence + (optionally) debounce
+        # Prevents premature stopping by requiring EOS to be both confident and stable.
+        #
+        # Problem: Model sometimes samples EOS slightly before intended end, causing
+        # immediate stop with no chance to recover.
+        #
+        # Solution: Gate EOS sampling with three requirements:
+        #   1. Probability: EOS must have >= eos_p_threshold probability (default 0.50)
+        #   2. Margin: EOS logit must be >= eos_margin above runner-up (default 1.0)
+        #   3. Debounce: EOS must stay "strong" for eos_debounce_k steps (default 2)
+        #
+        # If EOS not allowed, mask to -inf → forces non-EOS sample.
+        # State (eos_strong_streak) passed via kwargs for concurrency safety.
+        #
+        # See kanzi repo: packages/chantek-monolith/IMPLEMENTATION_PLAN.md
+        #
         # Extract EOS gating parameters from kwargs
         eos_p_threshold = kwargs.get("eos_p_threshold", 0.50)
         eos_margin = kwargs.get("eos_margin", 1.0)
