@@ -373,9 +373,9 @@ class Model(nn.Module, PyTorchModelHubMixin):
         # Debugging kwargs
         last_text_eos_pos = kwargs.get("last_text_eos_pos", None)
         distance_from_text_eos = None
-        if last_text_eos_pos is not None:
+        if logger.isEnabledFor(logging.DEBUG) and last_text_eos_pos is not None:
             logger.debug(f"last_text_eos_pos: {last_text_eos_pos}")
-            distance_from_text_eos = curr_pos - last_text_eos_pos
+            distance_from_text_eos = input_pos[..., -1] - last_text_eos_pos
 
         assert self.backbone.caches_are_enabled(), "backbone caches are not enabled"
         curr_backbone_mask = _index_causal_mask(self.backbone_causal_mask, input_pos)
